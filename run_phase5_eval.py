@@ -321,11 +321,22 @@ if __name__ == "__main__":
         help="Pool size to draw genuinely-multi-hop examples from (only used "
              "with --genuinely_multihop).",
     )
+    parser.add_argument(
+        "--top_k", type=int, default=None,
+        help="Override retriever top_k. IMPORTANT for --genuinely_multihop: "
+             "HotpotQA distractor context has exactly 10 paragraphs, so "
+             "top_k=10 (the config default) retrieves the entire corpus and "
+             "single-shot recall is always 1.0 - the filter can never find "
+             "anything. Use a real subset (e.g. 5) so single-shot retrieval "
+             "can genuinely miss a gold doc.",
+    )
     args = parser.parse_args()
 
     cfg = PipelineConfig()
     if args.no_reranker:
         cfg.reranker.enabled = False
+    if args.top_k is not None:
+        cfg.retriever.top_k = args.top_k
     run_eval(
         cfg, max_examples=args.max_examples, max_hops=args.max_hops,
         genuinely_multihop=args.genuinely_multihop, candidate_pool=args.candidate_pool,
