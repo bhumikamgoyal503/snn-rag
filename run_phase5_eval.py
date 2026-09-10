@@ -42,17 +42,27 @@ from snn_rag.core.pipeline import RAGPipeline
 from snn_rag.core.retriever import BaseRetriever, SingleShotRetriever
 from snn_rag.core.vector_store import FAISSVectorStore
 from snn_rag.data.hotpotqa_loader import load_hotpotqa
+from snn_rag.data.musique_loader import load_musique
 from snn_rag.evaluation.metrics import (
     exact_match,
     retrieval_precision,
     retrieval_recall,
     token_f1,
 )
+from snn_rag.evaluation.stats import bootstrap_ci, format_ci, paired_bootstrap_ci
 from snn_rag.planning.multi_hop_planner import MultiHopRetriever
 from snn_rag.solvers.classical import ClassicalQPSolver
 from snn_rag.solvers.snn_solver import SNNQPSolver
 
 ARMS = ["single_shot", "multi_hop", "multi_hop_qp_classical", "multi_hop_qp_snn"]
+
+# Metrics that get a bootstrap CI per arm, and a paired CI against single-shot.
+CI_METRICS = ["retrieval_precision", "exact_match", "token_f1", "retrieval_recall"]
+
+DATASETS = {
+    "hotpotqa": load_hotpotqa,
+    "musique": load_musique,
+}
 
 # Cited from the published papers - never measured on this project's
 # hardware/model. Kept separate from our own results in the output.
@@ -166,19 +176,22 @@ def run_eval(
     max_hops: int,
     genuinely_multihop: bool = False,
     candidate_pool: int = 300,
+    dataset: str = "hotpotqa",
+    results_name: str | None = None,
 ) -> dict:
     embedder = Embedder(cfg.embedding)
+    loader = DATASETS[dataset]
 
     if genuinely_multihop:
-        print(f"[Phase 5] Loading a candidate pool of {candidate_pool} HotpotQA "
+        print(f"[Phase 5] Loading a candidate pool of {candidate_pool} {dataset} "
               f"validation examples to filter for genuinely multi-hop cases...")
-        candidates = load_hotpotqa(split="validation", max_examples=candidate_pool)
+        candidates = loader(split="validation", max_examples=candidate_pool)
         examples = filter_genuinely_multihop(candidates, embedder, cfg, max_examples)
         print(f"  Kept {len(examples)}/{len(candidates)} examples where single-shot "
               f"recall < 1.0 (single retrieval alone can't reach every gold doc).")
     else:
-        print(f"[Phase 5] Loading HotpotQA validation (max {max_examples})...")
-        examples = load_hotpotqa(split="validation", max_examples=max_examples)
+        print(f"[Phase 5] Loading {dataset} validation (max {max_examples})...")
+        examples = loader(split="validation", max_examples=max_examples)
         print(f"  Loaded {len(examples)} examples.")
 
     generator = Generator(cfg.generator)
@@ -242,19 +255,38 @@ def run_eval(
                     "mean_classical_solve_time_s": sum(c["classical_solve_time_s"] for c in comparisons) / len(comparisons),
                     "mean_snn_solve_time_s": sum(c["snn_solve_time_s"] for c in comparisons) / len(comparisons),
                 }
+
+        # Marginal 95% bootstrap CIs for each headline metric.
+        agg["ci"] = {
+            m: bootstrap_ci([r[m] for r in rows]) for m in CI_METRICS
+        }
         aggregate[arm] = agg
+
+    # Paired CIs on the difference against the single-shot baseline. Every arm
+    # ran on the identical example set, so the paired interval is the one that
+    # supports (or refuses) a claim of improvement.
+    baseline_rows = per_arm_results["single_shot"]
+    for arm, rows in per_arm_results.items():
+        if arm == "single_shot":
+            continue
+        aggregate[arm]["ci_vs_single_shot"] = {
+            m: paired_bootstrap_ci([r[m] for r in rows], [b[m] for b in baseline_rows])
+            for m in CI_METRICS
+        }
 
     result = {
         "phase": 5,
         "description": "Ablation: single-shot vs multi-hop vs multi-hop+classical-QP vs multi-hop+SNN",
         "total_time_s": elapsed,
         "config": {
+            "dataset": dataset,
             "embedding_model": cfg.embedding.model_name,
             "generator_model": cfg.generator.model_name,
             "retriever_top_k": cfg.retriever.top_k,
             "reranker_enabled": cfg.reranker.enabled,
             "max_hops": max_hops,
             "genuinely_multihop_filter": genuinely_multihop,
+            "candidate_pool": candidate_pool if genuinely_multihop else None,
         },
         "aggregate": aggregate,
         "per_example": per_arm_results,
@@ -263,7 +295,9 @@ def run_eval(
 
     out_dir = Path(cfg.results_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "phase5_results.json"
+    # Per-dataset filename so a second dataset's run can't clobber the first's.
+    # results/phase5_results.json stays as the original frozen HotpotQA spine.
+    out_path = out_dir / f"{results_name or f'phase5_{dataset}'}.json"
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2)
 
@@ -274,14 +308,31 @@ def run_eval(
         "depend on flan-t5-base's answer quality, which is a separate, weak "
         "link in the chain.\n"
     )
-    print(f"{'Arm':<26}{'EM':>7}{'F1':>7}{'R.Recall':>10}{'Calls/Q':>9}{'Latency':>10}")
+    print(f"{'Arm':<26}{'EM':>7}{'F1':>7}{'Prec.':>8}{'R.Recall':>10}{'Calls/Q':>9}{'Latency':>10}")
     for arm in ARMS:
         a = aggregate[arm]
         print(
             f"{arm:<26}{a['mean_exact_match']:>7.3f}{a['mean_token_f1']:>7.3f}"
+            f"{a['mean_retrieval_precision']:>8.3f}"
             f"{a['mean_retrieval_recall']:>10.3f}{a['mean_retrieval_calls']:>9.2f}"
             f"{a['mean_latency_s']:>9.2f}s"
         )
+
+    print(f"\n95% bootstrap CIs (n={aggregate['single_shot']['n_examples']}):")
+    for arm in ARMS:
+        print(f"  {arm}")
+        for m in CI_METRICS:
+            print(f"    {m:<22}{format_ci(aggregate[arm]['ci'][m])}")
+
+    print("\nPaired difference vs single-shot (95% CI; * = excludes zero):")
+    for arm in ARMS:
+        if arm == "single_shot":
+            continue
+        print(f"  {arm}")
+        for m in CI_METRICS:
+            ci = aggregate[arm]["ci_vs_single_shot"][m]
+            star = " *" if ci["significant"] else ""
+            print(f"    {m:<22}{format_ci(ci)}{star}")
     snn_qp = aggregate.get("multi_hop_qp_snn", {}).get("qp", {}).get("snn_vs_classical")
     if snn_qp:
         # Lead with solution equivalence, not wall-clock: a spiking solver
@@ -330,6 +381,14 @@ if __name__ == "__main__":
              "anything. Use a real subset (e.g. 5) so single-shot retrieval "
              "can genuinely miss a gold doc.",
     )
+    parser.add_argument(
+        "--dataset", choices=sorted(DATASETS), default="hotpotqa",
+        help="Which multi-hop benchmark to evaluate on.",
+    )
+    parser.add_argument(
+        "--results_name", type=str, default=None,
+        help="Output filename stem under results/ (default: phase5_<dataset>).",
+    )
     args = parser.parse_args()
 
     cfg = PipelineConfig()
@@ -340,4 +399,5 @@ if __name__ == "__main__":
     run_eval(
         cfg, max_examples=args.max_examples, max_hops=args.max_hops,
         genuinely_multihop=args.genuinely_multihop, candidate_pool=args.candidate_pool,
+        dataset=args.dataset, results_name=args.results_name,
     )
