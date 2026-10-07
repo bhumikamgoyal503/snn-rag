@@ -5,6 +5,10 @@ import numpy as np
 
 from snn_rag.config import QPConfig
 from snn_rag.core.vector_store import RetrievedDoc
+from snn_rag.evaluation.metrics import (
+    retrieval_precision_by_index,
+    retrieval_recall_by_index,
+)
 from snn_rag.solvers.classical import ClassicalQPSolver
 from snn_rag.solvers.qp_utils import build_qp_matrices, ensure_psd
 
@@ -58,6 +62,17 @@ class TestClassicalQPSolver:
         sol_redundant = ClassicalQPSolver().solve(Q_redundant, c)
 
         assert sol_redundant.x.sum() < sol_independent.x.sum()
+
+
+class TestRetrievalMetrics:
+    def test_repeated_titles_do_not_falsely_count_as_gold_hits(self):
+        # In MuSiQue, a distractor can reuse the same title as a supporting fact
+        # in the same question. Matching on title inflates recall/precision.
+        retrieved_ids = [0, 1, 2]
+        gold_ids = {1, 3}
+
+        assert retrieval_precision_by_index(retrieved_ids, gold_ids) == 1 / 3
+        assert retrieval_recall_by_index(retrieved_ids, gold_ids) == 1 / 2
 
 
 class TestBuildQPMatrices:

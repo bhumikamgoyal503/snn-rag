@@ -27,6 +27,7 @@ class HotpotQAExample:
     question: str
     answer: str
     gold_titles: set[str]          # titles of the 2 supporting paragraphs
+    gold_doc_ids: set[int]         # paragraph indices of the gold supporting docs
     context_docs: list[str]         # 10 flattened paragraph texts
     context_titles: list[str]       # corresponding titles
     level: str                     # "easy", "medium", "hard"
@@ -67,6 +68,9 @@ def load_hotpotqa(
         ]
 
         gold_titles = set(row["supporting_facts"]["title"])
+        gold_doc_ids = {
+            i for i, title in enumerate(titles) if title in gold_titles
+        }
 
         examples.append(
             HotpotQAExample(
@@ -74,6 +78,7 @@ def load_hotpotqa(
                 question=row["question"],
                 answer=row["answer"],
                 gold_titles=gold_titles,
+                gold_doc_ids=gold_doc_ids,
                 context_docs=context_docs,
                 context_titles=titles,
                 level=row["level"],
@@ -102,11 +107,15 @@ def iter_examples(
             for t, sents in zip(titles, sentences_list)
         ]
         gold_titles = set(row["supporting_facts"]["title"])
+        gold_doc_ids = {
+            i for i, title in enumerate(titles) if title in gold_titles
+        }
         yield HotpotQAExample(
             qid=row["id"],
             question=row["question"],
             answer=row["answer"],
             gold_titles=gold_titles,
+            gold_doc_ids=gold_doc_ids,
             context_docs=context_docs,
             context_titles=titles,
             level=row["level"],

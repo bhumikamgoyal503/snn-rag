@@ -53,6 +53,7 @@ def load_musique(
         titles = [p["title"] for p in paragraphs]
         context_docs = [f"{p['title']}: {p['paragraph_text']}" for p in paragraphs]
         gold_titles = {p["title"] for p in paragraphs if p["is_supporting"]}
+        gold_doc_ids = {idx for idx, p in enumerate(paragraphs) if p.get("is_supporting", False)}
 
         examples.append(
             HotpotQAExample(
@@ -60,6 +61,7 @@ def load_musique(
                 question=row["question"],
                 answer=row["answer"],
                 gold_titles=gold_titles,
+                gold_doc_ids=gold_doc_ids,
                 context_docs=context_docs,
                 context_titles=titles,
                 # MuSiQue ships no easy/medium/hard label; hop count is the

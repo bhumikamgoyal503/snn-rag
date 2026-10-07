@@ -61,10 +61,30 @@ def token_f1(prediction: str, gold: str) -> float:
 
 # ── Retrieval-level metrics ────────────────────────────────────────
 
+def retrieval_precision_by_index(
+    retrieved_doc_ids: list[int], gold_doc_ids: set[int]
+) -> float:
+    """Fraction of retrieved docs whose document index is gold for this question."""
+    if not retrieved_doc_ids:
+        return 0.0
+    hits = sum(1 for doc_id in retrieved_doc_ids if doc_id in gold_doc_ids)
+    return hits / len(retrieved_doc_ids)
+
+
+def retrieval_recall_by_index(
+    retrieved_doc_ids: list[int], gold_doc_ids: set[int]
+) -> float:
+    """Fraction of gold document indices that were retrieved."""
+    if not gold_doc_ids:
+        return 1.0
+    hits = sum(1 for doc_id in retrieved_doc_ids if doc_id in gold_doc_ids)
+    return hits / len(gold_doc_ids)
+
+
 def retrieval_precision(
     retrieved_titles: list[str], gold_titles: set[str]
 ) -> float:
-    """Fraction of retrieved docs that are gold."""
+    """Backward-compatible title-based metric for legacy callers."""
     if not retrieved_titles:
         return 0.0
     hits = sum(1 for t in retrieved_titles if t in gold_titles)
@@ -74,7 +94,7 @@ def retrieval_precision(
 def retrieval_recall(
     retrieved_titles: list[str], gold_titles: set[str]
 ) -> float:
-    """Fraction of gold docs that were retrieved."""
+    """Backward-compatible title-based recall for legacy callers."""
     if not gold_titles:
         return 1.0
     hits = sum(1 for t in retrieved_titles if t in gold_titles)

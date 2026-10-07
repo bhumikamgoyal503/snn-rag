@@ -33,8 +33,8 @@ from snn_rag.data.hotpotqa_loader import load_hotpotqa
 from snn_rag.evaluation.metrics import (
     exact_match,
     token_f1,
-    retrieval_precision,
-    retrieval_recall,
+    retrieval_precision_by_index,
+    retrieval_recall_by_index,
 )
 
 
@@ -72,16 +72,16 @@ def run_eval(cfg: PipelineConfig, max_examples: int = 50) -> dict:
         # -- Run --
         output = pipeline.run(ex.question)
 
-        # -- Extract titles for retrieval metrics --
-        retrieved_titles = [
-            parse_title_from_doc(d.text) for d in output.retrieval.docs
-        ]
+        # -- Match on document index rather than title, since titles can repeat
+        # within a single question (notably in MuSiQue). HotpotQA keeps unique
+        # titles, but index matching is the correct invariant for both datasets.
+        retrieved_doc_ids = [d.doc_id for d in output.retrieval.docs]
 
         # -- Score --
         em = exact_match(output.answer, ex.answer)
         f1 = token_f1(output.answer, ex.answer)
-        r_prec = retrieval_precision(retrieved_titles, ex.gold_titles)
-        r_rec = retrieval_recall(retrieved_titles, ex.gold_titles)
+        r_prec = retrieval_precision_by_index(retrieved_doc_ids, ex.gold_doc_ids)
+        r_rec = retrieval_recall_by_index(retrieved_doc_ids, ex.gold_doc_ids)
 
         results.append({
             "qid": ex.qid,

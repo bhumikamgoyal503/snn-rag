@@ -45,8 +45,8 @@ from snn_rag.data.hotpotqa_loader import load_hotpotqa
 from snn_rag.data.musique_loader import load_musique
 from snn_rag.evaluation.metrics import (
     exact_match,
-    retrieval_precision,
-    retrieval_recall,
+    retrieval_precision_by_index,
+    retrieval_recall_by_index,
     token_f1,
 )
 from snn_rag.evaluation.stats import bootstrap_ci, format_ci, paired_bootstrap_ci
@@ -142,6 +142,18 @@ def extract_qp_stats(retrieval_metadata: dict) -> list[dict]:
     return [hop.qp for hop in hops if hop.qp is not None]
 
 
+def infer_hop_bucket(example) -> str | None:
+    """MuSiQue encodes hop count in the question ID and level field."""
+    level = str(getattr(example, "level", "")).lower()
+    if level.startswith("2hop"):
+        return "2"
+    if level.startswith("3hop"):
+        return "3"
+    if level.startswith("4hop"):
+        return "4"
+    return None
+
+
 def filter_genuinely_multihop(
     candidates: list,
     embedder: Embedder,
@@ -162,8 +174,8 @@ def filter_genuinely_multihop(
         store = FAISSVectorStore(embedder)
         store.add_documents(ex.context_docs)
         docs = SingleShotRetriever(store, cfg.retriever, cfg.reranker).retrieve(ex.question).docs
-        titles = [parse_title_from_doc(d.text) for d in docs]
-        if retrieval_recall(titles, ex.gold_titles) < 1.0:
+        retrieved_doc_ids = [d.doc_id for d in docs]
+        if retrieval_recall_by_index(retrieved_doc_ids, ex.gold_doc_ids) < 1.0:
             kept.append(ex)
         if len(kept) >= target_n:
             break
@@ -181,6 +193,10 @@ def run_eval(
 ) -> dict:
     embedder = Embedder(cfg.embedding)
     loader = DATASETS[dataset]
+    out_dir = Path(cfg.results_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_stem = results_name or f"phase5_{dataset}"
+    checkpoint_path = out_dir / f"{output_stem}.partial.json"
 
     if genuinely_multihop:
         print(f"[Phase 5] Loading a candidate pool of {candidate_pool} {dataset} "
@@ -197,6 +213,20 @@ def run_eval(
     generator = Generator(cfg.generator)
 
     per_arm_results: dict[str, list[dict]] = {arm: [] for arm in ARMS}
+    if checkpoint_path.exists():
+        with open(checkpoint_path) as f:
+            checkpoint = json.load(f)
+        if checkpoint.get("config", {}).get("dataset") != dataset:
+            raise ValueError(f"Checkpoint dataset mismatch: {checkpoint_path}")
+        per_arm_results = checkpoint["per_example"]
+        completed_qids = {
+            row["qid"] for row in per_arm_results["single_shot"]
+        }
+        examples = [ex for ex in examples if ex.qid not in completed_qids]
+        print(
+            f"  Resuming from {checkpoint_path}: "
+            f"{len(completed_qids)} examples already complete."
+        )
     t_total = perf_counter()
 
     for ex in tqdm(examples, desc="Phase 5 ablation"):
@@ -208,22 +238,37 @@ def run_eval(
             pipeline = RAGPipeline(retriever, generator, cfg)
             output = pipeline.run(ex.question)
 
-            retrieved_titles = [
-                parse_title_from_doc(d.text) for d in output.retrieval.docs
-            ]
+            retrieved_doc_ids = [d.doc_id for d in output.retrieval.docs]
             qp_records = extract_qp_stats(output.retrieval.metadata)
 
             per_arm_results[arm].append({
                 "qid": ex.qid,
                 "exact_match": exact_match(output.answer, ex.answer),
                 "token_f1": token_f1(output.answer, ex.answer),
-                "retrieval_precision": retrieval_precision(retrieved_titles, ex.gold_titles),
-                "retrieval_recall": retrieval_recall(retrieved_titles, ex.gold_titles),
+                "retrieval_precision": retrieval_precision_by_index(retrieved_doc_ids, ex.gold_doc_ids),
+                "retrieval_recall": retrieval_recall_by_index(retrieved_doc_ids, ex.gold_doc_ids),
                 "num_hops": output.retrieval.num_hops,
                 "num_docs_final": len(output.retrieval.docs),
                 "latency_s": output.latency_s,
+                "hop_bucket": infer_hop_bucket(ex),
                 "qp_records": qp_records,
             })
+
+        with open(checkpoint_path, "w") as f:
+            json.dump({
+                "phase": 5,
+                "config": {
+                    "dataset": dataset,
+                    "embedding_model": cfg.embedding.model_name,
+                    "generator_model": cfg.generator.model_name,
+                    "retriever_top_k": cfg.retriever.top_k,
+                    "reranker_enabled": cfg.reranker.enabled,
+                    "max_hops": max_hops,
+                    "genuinely_multihop_filter": genuinely_multihop,
+                    "candidate_pool": candidate_pool if genuinely_multihop else None,
+                },
+                "per_example": per_arm_results,
+            }, f)
 
     elapsed = perf_counter() - t_total
 
@@ -239,6 +284,19 @@ def run_eval(
             "mean_retrieval_calls": sum(r["num_hops"] for r in rows) / n,
             "mean_latency_s": sum(r["latency_s"] for r in rows) / n,
         }
+
+        by_hop = {}
+        for bucket in ["2", "3", "4"]:
+            bucket_rows = [r for r in rows if r.get("hop_bucket") == bucket]
+            if not bucket_rows:
+                continue
+            bucket_precision = sum(r["retrieval_precision"] for r in bucket_rows) / len(bucket_rows)
+            by_hop[bucket] = {
+                "n_examples": len(bucket_rows),
+                "mean_retrieval_precision": bucket_precision,
+            }
+        if by_hop:
+            agg["precision_by_hop"] = by_hop
         all_qp = [rec for r in rows for rec in r["qp_records"]]
         if all_qp:
             agg["qp"] = {
@@ -273,6 +331,19 @@ def run_eval(
             m: paired_bootstrap_ci([r[m] for r in rows], [b[m] for b in baseline_rows])
             for m in CI_METRICS
         }
+        if "precision_by_hop" in aggregate[arm]:
+            baseline_by_hop = {}
+            for bucket in ["2", "3", "4"]:
+                bucket_rows = [r for r in baseline_rows if r.get("hop_bucket") == bucket]
+                if bucket_rows:
+                    baseline_by_hop[bucket] = sum(r["retrieval_precision"] for r in bucket_rows) / len(bucket_rows)
+            aggregate[arm]["precision_gain_vs_single_shot_by_hop"] = {}
+            for bucket, info in aggregate[arm]["precision_by_hop"].items():
+                base = baseline_by_hop.get(bucket)
+                if base is None:
+                    continue
+                info["gain_vs_single_shot"] = info["mean_retrieval_precision"] - base
+                aggregate[arm]["precision_gain_vs_single_shot_by_hop"][bucket] = info["gain_vs_single_shot"]
 
     result = {
         "phase": 5,
@@ -286,6 +357,7 @@ def run_eval(
             "reranker_enabled": cfg.reranker.enabled,
             "max_hops": max_hops,
             "genuinely_multihop_filter": genuinely_multihop,
+            "genuinely_multihop_rule": "keep only examples with single-shot retrieval recall < 1.0; applied equally to all datasets",
             "candidate_pool": candidate_pool if genuinely_multihop else None,
         },
         "aggregate": aggregate,
@@ -293,13 +365,12 @@ def run_eval(
         "cited_baselines": CITED_BASELINES,
     }
 
-    out_dir = Path(cfg.results_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
     # Per-dataset filename so a second dataset's run can't clobber the first's.
     # results/phase5_results.json stays as the original frozen HotpotQA spine.
-    out_path = out_dir / f"{results_name or f'phase5_{dataset}'}.json"
+    out_path = out_dir / f"{output_stem}.json"
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2)
+    checkpoint_path.unlink(missing_ok=True)
 
     print(f"\n[Phase 5] Results saved to {out_path}\n")
     print(
